@@ -1,0 +1,21 @@
+[project]
+name = "gvon"
+version = "0.1.0"
+description = "Good Vibes Only Nullifier: ingest your X engagements, label them with a frontier model, distill into a local CPU/Metal classifier, and strip the bad vibes out of x.com responses at the network layer."
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "requests>=2.32",
+  "anthropic>=0.40",
+  "mitmproxy>=11",
+  "sentence-transformers>=3.0",
+  "torch>=2.4",
+  "scikit-learn>=1.5",
+  "numpy>=1.26",
+  "joblib>=1.4",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.setuptools]
+packages = ["gvon"]

@@ -1,0 +1,16 @@
+# secrets
+.env
+*.pem
+# local data: raw ingest, labels, blocklists, trained models never leave this machine
+data/
+models/
+# python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+# mitmproxy
+.mitmproxy/
+# os
+.DS_Store
