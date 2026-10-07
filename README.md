@@ -1,4 +1,6 @@
-# Good Vibes Only Nullifier (GVON)
+<p align="center"><img src="assets/nullifier-wordmark.png" alt="Nullifier: Good Vibes Only" width="800"></p>
+
+# Nullifier — Good Vibes Only (GVON) · `$NULL`
 
 GVON is a Good Vibes Only Nullifier: a local, low-stack network classifier and nullifier for X, built so
 the vile stuff never reaches your eyes. It reads a week of the replies, mentions and quotes aimed at your
