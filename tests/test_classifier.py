@@ -271,3 +271,258 @@ def test_content_text() -> None:
 def test_device_override(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GVON_DEVICE", "cpu")
     assert clf_mod.pick_device() == "cpu"
+
+
+# --------------------------------------------------------------------------- multi-source training
+
+
+def _split_sources(root: Path) -> tuple[Path, Path]:
+    """The synthetic rows split into an X half (tweets.jsonl) and a Telegram half (telegram_tweets.jsonl).
+    Telegram rows get "chat:msg" ids and author ids that collide with X author ids on purpose."""
+    raw, labels = synthetic_rows()
+    x_raw, x_lab, tg_raw, tg_lab = [], [], [], []
+    for i, (r, lab) in enumerate(zip(raw, labels)):
+        if i % 2:
+            tid = f"-100{i}:{i}"
+            tg_raw.append({**r, "id": tid, "author_id": f"a{i - 1}", "platform": "telegram"})
+            tg_lab.append({**lab, "id": tid, "author_id": f"a{i - 1}"})
+        else:
+            x_raw.append(r)
+            x_lab.append(lab)
+    labels_dir, raw_dir = root / "data/labels", root / "data/raw"
+    write_jsonl(raw_dir / "tweets.jsonl", x_raw)
+    write_jsonl(labels_dir / "tweets.jsonl", x_lab)
+    write_jsonl(raw_dir / "telegram.jsonl", tg_raw)
+    write_jsonl(labels_dir / "telegram_tweets.jsonl", tg_lab)
+    return labels_dir, raw_dir
+
+
+def test_resolve_sources_discovers_and_maps_by_prefix(tmp_path: Path) -> None:
+    labels_dir, raw_dir = _split_sources(tmp_path)
+    (labels_dir / "_cache.jsonl").write_text("")  # private files are never training input
+    srcs = train_mod.resolve_sources(None, None, labels_dir, raw_dir)
+    assert [(s, lp.name, rp.name) for s, lp, rp in srcs] == [("x", "tweets.jsonl", "tweets.jsonl"),
+                                                             ("telegram", "telegram_tweets.jsonl", "telegram.jsonl")]
+    one = train_mod.resolve_sources(labels_dir / "telegram_tweets.jsonl", None, labels_dir, raw_dir)
+    assert [(s, rp.name) for s, _, rp in one] == [("telegram", "telegram.jsonl")]
+    with pytest.raises(ValueError):
+        train_mod.resolve_sources([labels_dir / "tweets.jsonl", labels_dir / "telegram_tweets.jsonl"],
+                                  [raw_dir / "tweets.jsonl"], labels_dir, raw_dir)
+    with pytest.raises(FileNotFoundError):
+        train_mod.resolve_sources(None, None, tmp_path / "empty", raw_dir)
+    (raw_dir / "telegram.jsonl").unlink()
+    with pytest.raises(FileNotFoundError):
+        train_mod.resolve_sources(None, None, labels_dir, raw_dir)
+
+
+def test_load_sources_namespaces_non_x_authors(tmp_path: Path) -> None:
+    labels_dir, raw_dir = _split_sources(tmp_path)
+    labels, raw, n_rows = train_mod.load_sources(train_mod.resolve_sources(None, None, labels_dir, raw_dir))
+    assert n_rows == {"x": 41, "telegram": 41}
+    assert labels["synth0"]["author_id"] == "a0" and labels["synth0"]["_source"] == "x"
+    assert labels["-1001:1"]["author_id"] == "telegram:a0" and labels["-1001:1"]["_source"] == "telegram"
+    assert raw["-1001:1"] and raw["synth0"]
+    ds = train_mod.build_dataset(labels, raw)
+    assert "a0" in ds.authors and "telegram:a0" in ds.authors
+    assert ds.groups[ds.authors.index("a0")] != ds.groups[ds.authors.index("telegram:a0")]
+    assert set(ds.counts_by_source) == {"x", "telegram"}
+    assert sum(ds.counts_by_source["x"].values()) + sum(ds.counts_by_source["telegram"].values()) == 82
+    assert ds.sources.count("telegram") == sum(v for k, v in ds.counts_by_source["telegram"].items()
+                                               if not k.startswith("skipped"))
+
+
+def test_train_merges_every_labels_file_by_default(tmp_path: Path) -> None:
+    labels_dir, raw_dir = _split_sources(tmp_path)
+    out = tmp_path / "models/latest"
+    rc = train_mod.main(["--labels-dir", str(labels_dir), "--raw-dir", str(raw_dir), "--out", str(out),
+                         "--threshold", "0.5"])
+    assert rc == 0
+    cfg = json.loads((out / "config.json").read_text())
+    assert cfg["n_train"] == 82
+    assert cfg["label_counts"] == {"nullify": 36, "good": 36, "neutral": 10}
+    by_src = cfg["label_counts_by_source"]
+    assert set(by_src) == {"x", "telegram"}
+    assert sum(by_src["x"].values()) == 41 and sum(by_src["telegram"].values()) == 41
+    assert [(s["source"], s["n_label_rows"], s["n_train"]) for s in cfg["label_sources"]] == [("x", 41, 41),
+                                                                                             ("telegram", 41, 41)]
+    assert cfg["n_authors"] == 82  # colliding raw author ids stay distinct across platforms
+    assert cfg["metrics"]["split"] == "grouped_by_author"
+    # explicit pairs still work, one --raw per --labels
+    out2 = tmp_path / "models/x_only"
+    assert train_mod.main(["--labels", str(labels_dir / "tweets.jsonl"), "--raw", str(raw_dir / "tweets.jsonl"),
+                           "--out", str(out2), "--threshold", "0.5"]) == 0
+    assert json.loads((out2 / "config.json").read_text())["label_counts_by_source"].keys() == {"x"}
+
+
+def test_blocklist_platform_scoping(trained: dict, tmp_path: Path) -> None:
+    bl = tmp_path / "blocklist.json"
+    bl.write_text(json.dumps({"accounts": [
+        {"id": "999", "username": "Legacy_X", "nullify_score": 0.9, "summary": "s"},  # no platform key => x
+        {"id": "777", "username": "tg_scammer", "nullify_score": 0.9, "summary": "s", "platform": "telegram"}]}))
+    (tmp_path / "watchlist.json").write_text(json.dumps({"accounts": [
+        {"id": "555", "username": "tg_watch", "nullify_score": 0.5, "summary": "s", "platform": "telegram"}]}))
+    assert clf_mod.load_blocklist(bl) == ({"999", "777"}, {"legacy_x", "tg_scammer"})
+    assert clf_mod.load_blocklist(bl, platform="x") == ({"999"}, {"legacy_x"})
+    assert clf_mod.load_blocklist(bl, platform="telegram") == ({"777"}, {"tg_scammer"})
+    nul = Nullifier(trained["model_dir"], bl, threshold=0.6)
+    assert nul.is_blocked(author_id="777") and nul.is_blocked(username="legacy_x")  # None = any platform
+    assert nul.is_blocked(author_id="777", platform="telegram")
+    assert not nul.is_blocked(author_id="777", platform="x")
+    assert not nul.is_blocked(username="@Legacy_X", platform="telegram")
+    assert nul.is_blocked(username="@Legacy_X", platform="X")
+    assert nul.is_watched(author_id="555") and nul.is_watched(author_id="555", platform="telegram")
+    assert not nul.is_watched(author_id="555", platform="x")
+    assert nul.threshold_for(author_id="555", platform="telegram") == pytest.approx(0.6 - nul.watch_delta)
+    kind = "thank you, this was wonderful and helpful"
+    assert nul.should_nullify(kind, author_id="777", platform="telegram")
+    assert not nul.should_nullify(kind, author_id="777", platform="x")
+    assert nul.should_nullify(kind, author_id="777")
+
+
+# --------------------------------------------------------------------------- student v2: author context
+
+
+def test_author_scalars_with_missing_and_full_authors() -> None:
+    from datetime import datetime, timezone
+
+    k = len(clf_mod.AUTHOR_SCALAR_NAMES)
+    width = k + len(clf_mod.AUTHOR_MISSING_NAMES)
+    none = clf_mod.author_scalars(None)
+    assert none.shape == (width,)
+    assert np.isnan(none[:6]).all() and none[6] == 0.0  # has_bio is known: no bio
+    assert none[k:].tolist() == [1.0] * len(clf_mod.AUTHOR_MISSING_NAMES)
+    now = datetime(2026, 1, 11, tzinfo=timezone.utc)
+    full = clf_mod.author_scalars({"bio": "  synthetic   bio ", "followers": 99, "following": 9, "tweet_count": 0,
+                                   "created_at": "2026-01-01T00:00:00.000Z", "verified": True}, now)
+    assert full[:k] == pytest.approx([np.log1p(99), np.log1p(9), 0.0, np.log1p(10), np.log1p(9.9), 1.0, 1.0])
+    assert full[k:].tolist() == [0.0] * len(clf_mod.AUTHOR_MISSING_NAMES)
+    # legacy X format, junk values and a future creation date
+    odd = clf_mod.author_scalars({"followers": "lots", "following": -3, "tweet_count": True,
+                                  "created_at": "Mon Jan 12 00:00:00 +0000 2026", "verified": "yes"}, now)
+    assert odd[k:].tolist() == [1.0, 1.0, 1.0, 0.0, 1.0] and odd[3] == 0.0  # age clamped at 0
+    assert clf_mod.parse_created_at("Wed Oct 10 20:19:24 +0000 2018").year == 2018
+    assert clf_mod.parse_created_at("not a date") is None and clf_mod.parse_created_at(None) is None
+    assert clf_mod.author_bio({"bio": " a \n b "}) == "a b" and clf_mod.author_bio({"bio": None}) == ""
+    # scaling: unknown -> 0, indicators untouched, never NaN, even with an all-unknown column
+    raw = clf_mod.author_scalar_matrix([None, {"followers": 10, "verified": False}, {"followers": 1000}])
+    block = clf_mod.scale_author_block(raw, clf_mod.fit_author_scaler(raw))
+    assert block.shape == (3, width) and np.isfinite(block).all()
+    assert block[0, 0] == 0.0 and block[0, k] == 1.0 and block[1, k] == 0.0
+    assert clf_mod.author_signature(None) != clf_mod.author_signature({"bio": "x"})
+    tg = clf_mod.author_from_telegram_user({"id": 1, "description": None, "verified": True})
+    assert tg == {"bio": None, "followers": None, "following": None, "tweet_count": None, "created_at": None,
+                  "verified": True}
+
+
+def _users_rows(raw: list[dict], coverage: int = 2) -> list[dict]:
+    """Synthetic users.jsonl rows for every `coverage`-th author (others stay unknown). Hostile authors look
+    like throwaways (new, no followers, no bio); supportive ones are older with a bio."""
+    rows = []
+    for i, r in enumerate(raw):
+        if i % coverage:
+            continue
+        hostile = any(r["text"].startswith(h) for h in HOSTILE_OPENERS)
+        rows.append({"id": r["author_id"], "username": r["author_username"], "name": "synthetic",
+                     "description": "" if hostile else f"synthetic bio about gardening {i}",
+                     "created_at": "2025-12-20T00:00:00.000Z" if hostile else "2015-01-01T00:00:00.000Z",
+                     "public_metrics": {"followers_count": 1 if hostile else 500 + i, "following_count": 300,
+                                        "tweet_count": 5 if hostile else 4000},
+                     "verified": False})
+    return rows
+
+
+@pytest.fixture(scope="module")
+def trained_v2(tmp_path_factory: pytest.TempPathFactory) -> dict:
+    root = tmp_path_factory.mktemp("gvon_v2")
+    raw, labels = synthetic_rows()
+    for r in raw:
+        r["created_at"] = "2026-01-05T00:00:00.000Z"
+    raw_dir, labels_dir = root / "data/raw", root / "data/labels"
+    write_jsonl(raw_dir / "tweets.jsonl", raw)
+    write_jsonl(labels_dir / "tweets.jsonl", labels)
+    write_jsonl(raw_dir / "users.jsonl", _users_rows(raw))
+    blocklist = root / "data/blocklist.json"
+    blocklist.write_text(json.dumps({"accounts": []}))
+    out = root / "models/latest"
+    assert train_mod.main(["--labels-dir", str(labels_dir), "--raw-dir", str(raw_dir), "--out", str(out),
+                           "--threshold", "0.5"]) == 0
+    return {"root": root, "model_dir": out, "blocklist": blocklist, "raw_dir": raw_dir, "labels_dir": labels_dir}
+
+
+def test_train_v2_records_author_inputs(trained_v2: dict) -> None:
+    out = trained_v2["model_dir"]
+    cfg = json.loads((out / "config.json").read_text())
+    assert cfg["student_inputs"] == ["tweet_text", "author_bio", "author_stats"]
+    assert cfg["student_inputs_requested"] == "auto"
+    assert (out / clf_mod.AUTHOR_SCALER_FILE).exists()
+    width = len(clf_mod.AUTHOR_SCALAR_NAMES) + len(clf_mod.AUTHOR_MISSING_NAMES)
+    assert cfg["feature_dim"] == 2 * 384 + width
+    af = cfg["author_features"]
+    assert af["scalars"] == list(clf_mod.AUTHOR_SCALAR_NAMES)
+    assert af["missing_indicators"] == list(clf_mod.AUTHOR_MISSING_NAMES)
+    cov = af["coverage_by_source"]["x"]
+    assert cov["rows"] == 82 and cov["with_author"] == 41 and 0 < cov["with_bio"] < cov["with_author"]
+    assert cfg["metrics"]["split"] == "grouped_by_author" and cfg["probability_calibrated"] is True
+
+
+def test_v2_scores_with_and_without_author_context(trained_v2: dict, monkeypatch: pytest.MonkeyPatch) -> None:
+    nul = Nullifier(trained_v2["model_dir"], trained_v2["blocklist"])
+    assert nul.uses_author and nul.uses_author_bio and nul.author_scaler is not None
+    text = "what a weird synthetic remark about the weather"
+    throwaway = {"bio": "", "followers": 0, "following": 300, "tweet_count": 3,
+                 "created_at": "2026-01-01T00:00:00Z", "verified": False}
+    regular = {"bio": "synthetic bio about gardening", "followers": 900, "following": 300, "tweet_count": 5000,
+               "created_at": "2014-01-01T00:00:00Z", "verified": True}
+    partial = {"bio": None, "followers": "n/a", "created_at": "garbage"}
+    out = nul.score([text, text, text, text], authors=[None, throwaway, regular, partial])
+    assert all(np.isfinite(p) and 0.0 <= p <= 1.0 for p in out)
+    assert out[1] != out[2]  # the author block reaches the head
+    assert nul.score([text]) == [out[0]]  # no authors == every author unknown
+    assert nul.score(["@a https://t.co/x"], authors=[throwaway]) == [0.0]  # low-info still abstains
+    hostile = "you absolute idiot, everyone hates you"
+    assert nul.should_nullify(hostile, author=throwaway)
+    assert not nul.should_nullify("thank you, this was wonderful and helpful", author=regular)
+    with pytest.raises(ValueError):
+        nul.score([text], authors=[None, None])
+
+    def boom(*_a, **_k):  # cached (text, author) pairs never re-encode
+        raise AssertionError("encoder called on cached input")
+
+    monkeypatch.setattr(clf_mod, "encode", boom)
+    assert nul.score([text, text], authors=[throwaway, regular]) == out[1:3]
+
+
+def test_text_only_flag_and_v1_ignores_authors(trained_v2: dict, trained: dict, tmp_path: Path) -> None:
+    out = tmp_path / "model"
+    shutil.copytree(trained_v2["model_dir"], out)  # v1 retrain into a v2 dir removes the stale scaler
+    assert train_mod.main(["--labels-dir", str(trained_v2["labels_dir"]), "--raw-dir", str(trained_v2["raw_dir"]),
+                           "--out", str(out), "--threshold", "0.5", "--student-inputs", "text"]) == 0
+    cfg = json.loads((out / "config.json").read_text())
+    assert cfg["student_inputs"] == ["tweet_text"] and cfg["author_features"] is None
+    assert not (out / clf_mod.AUTHOR_SCALER_FILE).exists()
+    v1 = Nullifier(trained["model_dir"], trained["blocklist"])
+    assert not v1.uses_author
+    t = "you are garbage, log off"
+    assert v1.score([t], authors=[{"bio": "anything", "followers": 5}]) == v1.score([t])
+
+
+def test_default_platform_scopes_blocklist(tmp_path, monkeypatch):
+    """A Nullifier built with platform="x" ignores Telegram-only blocklist entries unless asked explicitly."""
+    import json
+    from gvon import classifier as c
+
+    bl = tmp_path / "blocklist.json"
+    bl.write_text(json.dumps({"accounts": [
+        {"id": "1", "username": "synthetic_x_hater", "platform": "x"},
+        {"id": "2", "username": "synthetic_tg_hater", "platform": "telegram"},
+    ]}))
+    n = c.Nullifier.__new__(c.Nullifier)
+    n.default_platform = "x"
+    n.blocklist_path = bl
+    n.watchlist_path = tmp_path / "watchlist.json"
+    n._load_lists()
+    assert n.is_blocked(username="synthetic_x_hater")
+    assert not n.is_blocked(username="synthetic_tg_hater")
+    assert n.is_blocked(username="synthetic_tg_hater", platform="telegram")
+    n.default_platform = None
+    assert n.is_blocked(username="synthetic_tg_hater")

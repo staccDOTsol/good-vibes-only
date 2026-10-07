@@ -117,7 +117,7 @@ def build_decider(threshold: float | None = None) -> Any:
     try:
         from gvon.classifier import Nullifier  # lazy: torch is heavy and may be absent in tests
 
-        nul = Nullifier(model_dir, blocklist, threshold=threshold)
+        nul = Nullifier(model_dir, blocklist, threshold=threshold, platform="x")
         warm = getattr(nul, "warmup", None)
         if callable(warm):
             warm()

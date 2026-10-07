@@ -440,3 +440,83 @@ def test_global_objects_unreferenced_nullified_tweet_still_counts_as_change() ->
     new, report = prune(page, StubDecider())
     assert new is not page and new["globalObjects"]["tweets"] == {}
     assert [r["entryId"] for r in report] == ["globalObjects.tweets.9"]
+
+
+# ---------------------------------------------------------------------------------- author context
+
+
+class AuthorDecider(StubDecider):
+    """A v2-style decider: declares `author` / `authors`, records what prune passed."""
+
+    def __init__(self) -> None:
+        super().__init__(set())
+        self.authors_seen: list[tuple[str | None, dict | None]] = []
+        self.warm_authors: list[list[dict | None]] = []
+
+    def score(self, texts: list[str], authors: list[dict | None] | None = None) -> list[float]:
+        assert authors is not None and len(authors) == len(texts)
+        self.warm_authors.append(list(authors))
+        return super().score(texts)
+
+    def should_nullify(self, text: str, *, author_id: str | None = None, username: str | None = None,
+                       author: dict | None = None) -> bool:
+        self.authors_seen.append((username, author))
+        return super().should_nullify(text, author_id=author_id, username=username)
+
+
+def _author_entry(tid: str, uid: str, name: str, text: str, user_extra: dict) -> dict:
+    user = {"rest_id": uid, "core": {"screen_name": name}, **user_extra}
+    return {"entryId": f"tweet-{tid}", "content": {"itemContent": {"tweet_results": {"result": {
+        "rest_id": tid, "core": {"user_results": {"result": user}},
+        "legacy": {"full_text": text, "in_reply_to_screen_name": "synthetic_owner",
+                   "in_reply_to_user_id_str": "1"}}}}}}
+
+
+def test_prune_passes_graphql_author_dicts() -> None:
+    full = {"is_blue_verified": True, "legacy": {"description": "synthetic bio", "followers_count": 12,
+                                                  "friends_count": 34, "statuses_count": 56,
+                                                  "created_at": "Wed Oct 10 20:19:24 +0000 2018"}}
+    newer = {"core": {"screen_name": "synthetic_new", "created_at": "Thu Jan 01 00:00:00 +0000 2026"},
+             "profile_bio": {"description": "moved bio"}, "legacy": {"followers_count": 0}}
+    payload = {"data": {"instructions": [{"entries": [
+        _author_entry("9001", "21", "synthetic_full", "@synthetic_owner hello there", full),
+        _author_entry("9002", "22", "synthetic_new", f"@synthetic_owner {MARKER}", newer),
+        _author_entry("9003", "23", "synthetic_bare", "@synthetic_owner plain words", {}),
+    ]}]}}
+    dec = AuthorDecider()
+    new, report = prune(payload, dec, owner_usernames=["synthetic_owner"])
+    assert [r["entryId"] for r in report] == ["tweet-9002"]
+    seen = dict(dec.authors_seen)
+    assert seen["synthetic_full"] == {"bio": "synthetic bio", "followers": 12, "following": 34, "tweet_count": 56,
+                                      "created_at": "Wed Oct 10 20:19:24 +0000 2018", "verified": True}
+    assert seen["synthetic_new"] == {"bio": "moved bio", "followers": 0, "following": None, "tweet_count": None,
+                                     "created_at": "Thu Jan 01 00:00:00 +0000 2026", "verified": None}
+    assert seen["synthetic_bare"]["bio"] is None and seen["synthetic_bare"]["verified"] is None
+    # the warm-up batch carried the same author dicts, aligned with its texts
+    assert len(dec.warm_authors) == 1
+    assert sorted((a or {}).get("bio") or "" for a in dec.warm_authors[0]) == ["", "moved bio", "synthetic bio"]
+
+
+def test_prune_passes_rest_author_dicts() -> None:
+    payload = {"globalObjects": {
+        "users": {"31": {"id_str": "31", "screen_name": "synthetic_rest", "description": "rest bio",
+                         "followers_count": 7, "friends_count": 8, "statuses_count": 9,
+                         "created_at": "Wed Oct 10 20:19:24 +0000 2018", "verified": False}},
+        "tweets": {"8001": {"id_str": "8001", "user_id_str": "31", "full_text": "@synthetic_owner words",
+                            "in_reply_to_screen_name": "synthetic_owner"},
+                   "8002": {"id_str": "8002", "user_id_str": "32", "full_text": "@synthetic_owner other",
+                            "in_reply_to_screen_name": "synthetic_owner"}}},
+        "timeline": {"instructions": []}}
+    dec = AuthorDecider()
+    new, report = prune(payload, dec, owner_usernames=["synthetic_owner"])
+    assert new is payload and report == []
+    by_name = dict(dec.authors_seen)
+    assert by_name["synthetic_rest"] == {"bio": "rest bio", "followers": 7, "following": 8, "tweet_count": 9,
+                                         "created_at": "Wed Oct 10 20:19:24 +0000 2018", "verified": False}
+    assert by_name[None] is None  # author 32 is not in globalObjects.users
+
+
+def test_deciders_without_author_parameter_are_called_as_before() -> None:
+    dec = StubDecider()
+    prune(load("home_timeline.json"), dec)
+    assert dec.calls  # StubDecider.should_nullify has no `author` parameter and still works

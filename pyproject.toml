@@ -12,6 +12,7 @@ dependencies = [
   "scikit-learn>=1.5",
   "numpy>=1.26",
   "joblib>=1.4",
+  "telethon>=1.36",
 ]
 
 [project.optional-dependencies]

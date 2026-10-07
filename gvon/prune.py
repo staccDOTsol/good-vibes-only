@@ -44,10 +44,16 @@ The decider is any object with the gvon.classifier.Nullifier interface:
 `should_nullify(text, *, author_id=None, username=None) -> bool` and optionally `score(texts)` (used only
 to batch-warm the classifier cache) and `is_blocked(*, author_id=None, username=None)` (used for
 user-only items; when absent we call `should_nullify("", ...)`).
+
+Author context: when the decider's should_nullify declares an `author` parameter (and score() an
+`authors` parameter), each judged tweet also carries its author's cheap context, read from the same
+payload: {bio, followers, following, tweet_count, created_at, verified} (graphql_author / rest_author).
+Fields the payload lacks are None (unknown). Deciders without those parameters are called exactly as before.
 """
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import logging
 import sys
@@ -128,6 +134,63 @@ def user_identity(u: Any) -> tuple[str | None, str | None]:
     return (str(uid) if uid not in (None, "") else None, name if isinstance(name, str) else None)
 
 
+def _first(*values: Any) -> Any:
+    """First value that is not None (0 and "" count as present)."""
+    return next((v for v in values if v is not None), None)
+
+
+def _verified(*flags: Any) -> bool | None:
+    """True if any verification flag is true, False if some flag is present and false, None if none is present."""
+    present = [f for f in flags if isinstance(f, bool)]
+    return any(present) if present else None
+
+
+def graphql_author(u: Any) -> dict[str, Any] | None:
+    """Author context of a GraphQL user result: legacy.description (or profile_bio.description),
+    legacy.followers_count / friends_count / statuses_count, legacy.created_at (newer builds: core.created_at),
+    is_blue_verified / legacy.verified (/ verification.verified). None when there is no user object."""
+    u = _dict(u)
+    if not u:
+        return None
+    legacy = _dict(u.get("legacy"))
+    return {
+        "bio": _first(legacy.get("description"), _path(u, "profile_bio", "description")),
+        "followers": legacy.get("followers_count"),
+        "following": legacy.get("friends_count"),
+        "tweet_count": legacy.get("statuses_count"),
+        "created_at": _first(legacy.get("created_at"), _path(u, "core", "created_at")),
+        "verified": _verified(u.get("is_blue_verified"), legacy.get("verified"), _path(u, "verification", "verified")),
+    }
+
+
+def rest_author(u: Any) -> dict[str, Any] | None:
+    """Author context of a legacy REST user object (globalObjects.users[id])."""
+    u = _dict(u)
+    if not u:
+        return None
+    return {
+        "bio": u.get("description"),
+        "followers": u.get("followers_count"),
+        "following": u.get("friends_count"),
+        "tweet_count": u.get("statuses_count"),
+        "created_at": u.get("created_at"),
+        "verified": _verified(u.get("is_blue_verified"), u.get("verified"), u.get("ext_is_blue_verified")),
+    }
+
+
+def tweet_author_context(t: dict[str, Any]) -> dict[str, Any] | None:
+    """graphql_author of the tweet's author (core.user_results.result), or None."""
+    return graphql_author(_path(t, "core", "user_results", "result"))
+
+
+def _accepts(fn: Any, name: str) -> bool:
+    """True when callable `fn` declares a parameter called `name` (explicitly, not just **kwargs)."""
+    try:
+        return name in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 def tweet_author(t: dict[str, Any]) -> tuple[str | None, str | None]:
     uid, name = user_identity(_path(t, "core", "user_results", "result"))
     if uid is None:
@@ -199,6 +262,10 @@ class _Judge:
         self.owner_usernames = {_norm(u) for u in owner_usernames if u}
         self.cache: MutableMapping[str, bool] = cache if cache is not None else {}
         self.text_scope = text_scope
+        # author context is passed only to deciders that declare it (stubs and older deciders: unchanged calls)
+        self.pass_author = _accepts(getattr(decider, "should_nullify", None), "author")
+        score = getattr(decider, "score", None)
+        self.pass_authors = callable(score) and _accepts(score, "authors")
 
     def is_owner(self, uid: str | None, username: str | None) -> bool:
         return (uid is not None and uid in self.owner_ids) or (bool(username) and _norm(username) in self.owner_usernames)
@@ -230,8 +297,10 @@ class _Judge:
     def in_text_scope(self, fields: dict[str, Any], quoted_author: tuple[str | None, str | None] | None) -> bool:
         return self.text_scope == "all" or self.engages_owner(fields, quoted_author)
 
-    def decide(self, tid: str | None, uid: str | None, name: str | None, text: str, in_scope: bool) -> bool:
-        """Blocklist first (any scope), then the text decider only for in-scope tweets. Cached by tweet id."""
+    def decide(self, tid: str | None, uid: str | None, name: str | None, text: str, in_scope: bool,
+               author: dict[str, Any] | None = None) -> bool:
+        """Blocklist first (any scope), then the text decider only for in-scope tweets. Cached by tweet id.
+        author: the tweet author's context dict, forwarded when the decider accepts it."""
         if self.is_owner(uid, name):
             return False
         key = f"tweet:{tid}" if tid else None
@@ -240,7 +309,10 @@ class _Judge:
         if self.blocked(uid, name):
             verdict = True
         elif in_scope:
-            verdict = bool(self.decider.should_nullify(text, author_id=uid, username=name))
+            if self.pass_author:
+                verdict = bool(self.decider.should_nullify(text, author_id=uid, username=name, author=author))
+            else:
+                verdict = bool(self.decider.should_nullify(text, author_id=uid, username=name))
         else:
             verdict = False
         if key is not None:
@@ -249,7 +321,8 @@ class _Judge:
 
     def tweet(self, t: dict[str, Any]) -> bool:
         uid, name = tweet_author(t)
-        return self.decide(tweet_id(t), uid, name, tweet_text(t), self._graphql_in_scope(t))
+        return self.decide(tweet_id(t), uid, name, tweet_text(t), self._graphql_in_scope(t),
+                           tweet_author_context(t) if self.pass_author else None)
 
     def _graphql_in_scope(self, t: dict[str, Any]) -> bool:
         if self.text_scope == "all":
@@ -265,6 +338,7 @@ class _Judge:
         if not callable(score):
             return
         texts: list[str] = []
+        authors: list[dict[str, Any] | None] = []
         for t in tweets:
             tid = tweet_id(t)
             uid, name = tweet_author(t)
@@ -278,8 +352,10 @@ class _Judge:
             text = tweet_text(t)
             if text:
                 texts.append(text)
+                authors.append(tweet_author_context(t))
         if texts:
-            score(texts)
+            # same author context as the per-tweet call, so the classifier's cache key matches
+            score(texts, authors=authors) if self.pass_authors else score(texts)
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -457,7 +533,8 @@ def _prune_global_objects(payload: dict[str, Any], judge: _Judge) -> tuple[dict[
         quoted = _rest_refs({"quoted_status_id_str": t.get("quoted_status_id_str")})
         quoted_author = (author_of(quoted[0]), uname(author_of(quoted[0]))) if quoted else None
         in_scope = judge.in_text_scope(t, quoted_author)
-        if judge.decide(tid, author, uname(author), str(t.get("full_text") or ""), in_scope):
+        ctx = rest_author(users.get(author or "")) if judge.pass_author else None
+        if judge.decide(tid, author, uname(author), str(t.get("full_text") or ""), in_scope, ctx):
             bad_tweets[tid] = f"tweet {tid} nullified"
     # Quotes/retweets of a nullified tweet go too (mirrors the GraphQL subtree rule). Iterate to a fixed
     # point so the result does not depend on dict order (RT -> quote -> toxic chains).

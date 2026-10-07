@@ -1,5 +1,6 @@
 # GVON pipeline. Every stage reads/writes local files under data/ and models/ (both gitignored).
-# Order: ingest (X API) -> label (frontier teacher) -> train (local student) -> proxy / userscript.
+# Order: ingest (X API) + telegram-ingest (Telethon) -> label (frontier teacher) -> train (local student)
+# -> sinks: proxy / userscript (x.com), telegram (Telegram).
 
 PY      := .venv/bin/python
 MITM    := .venv/bin/mitmdump
@@ -8,8 +9,12 @@ PORT    ?= 8080
 INGEST_ARGS ?=
 LABEL_ARGS  ?=
 TRAIN_ARGS  ?=
+# e.g. `make telegram-ingest TG_INGEST_ARGS="--chats 50"`
+TG_INGEST_ARGS ?=
+# e.g. `make telegram TG_ARGS="--backfill 50 --dry-run"`
+TG_ARGS     ?=
 
-.PHONY: setup ingest label train test proxy proxy-record userscript all clean-data
+.PHONY: setup ingest label train test proxy proxy-record userscript all clean-data telegram telegram-vault telegram-login telegram-ingest telegram-ingest-if-configured
 
 ## setup: create the uv-managed Python 3.12 venv and install gvon + dev deps
 setup:
@@ -48,8 +53,43 @@ proxy-record:
 userscript:
 	$(PY) scripts/gvon-userscript.py
 
-## all: ingest -> label -> train
-all: ingest label train
+## telegram-login: one-time interactive Telegram login (phone + code, 2FA password if set) -> data/telegram.session
+telegram-login:
+	$(PY) -m gvon.telegram_ingest login
+
+## telegram-ingest: pull the last 7 days of Telegram DMs / group replies / mentions -> data/raw/telegram*.jsonl
+##   (resumable via data/raw/_telegram_state.json; `make label` then labels them with --source all).
+##   Refuses to run while the sink (`make telegram`) uses the same session: stop the sink first.
+telegram-ingest:
+	$(PY) -m gvon.telegram_ingest pull $(TG_INGEST_ARGS)
+
+## telegram: Telegram sink, runs as you and deletes/mutes/archives nullified incoming messages (docs/TELEGRAM.md).
+##   Needs TG_API_ID/TG_API_HASH in .env and a session from `make telegram-login`. Vault: data/telegram_nullified.jsonl
+telegram:
+	$(PY) -m gvon.telegram_nullifier $(TG_ARGS)
+
+## telegram-vault: print the last N (default 20) nullified Telegram messages to audit false positives
+N ?= 20
+telegram-vault:
+	$(PY) -m gvon.telegram_nullifier --vault $(N)
+
+## telegram-ingest-if-configured: telegram-ingest when TG_API_ID/TG_API_HASH and a session (data/telegram.session
+##   or TG_SESSION) are present and no other gvon process (e.g. the running sink) holds that session; otherwise
+##   prints why and skips (exit 0). Used by `make all`.
+telegram-ingest-if-configured:
+	@if $(PY) -m gvon.telegram_client ready; then \
+		$(PY) -m gvon.telegram_ingest pull $(TG_INGEST_ARGS); \
+	else \
+		echo "== telegram-ingest skipped: see the reason above (X-only run; set TG_API_ID/TG_API_HASH in .env and run 'make telegram-login' to include Telegram) =="; \
+	fi
+
+## all: X ingest -> Telegram ingest (skipped unless configured) -> label (every source) -> train
+##   Serial even under `make -j`: each stage needs the previous one's output.
+all:
+	$(MAKE) ingest
+	$(MAKE) telegram-ingest-if-configured
+	$(MAKE) label
+	$(MAKE) train
 
 ## clean-data: delete ALL local data, labels, blocklist, recordings and trained models
 clean-data:

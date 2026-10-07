@@ -7,11 +7,19 @@ fine-tuning on so little data.
 
 What the student can and cannot learn (honest scope):
 - The teacher judged each tweet with the author's bio, account age, follower counts, the parent tweet
-  and all of that author's tweets together. The student sees ONLY the post text (config
-  `student_inputs`). Identity-driven nullify labels (spam_bot, shill, generic_filler,
-  engagement_farming) are therefore not learnable from text; those rows are dropped from training and
-  left to the blocklist. The positive class is content-intrinsic nullify (hostility, insults, FUD,
-  rug/scam insinuations, entitled demands, sneering, ...). `--target all` restores the old target.
+  and all of that author's tweets together. Student v1 (`--student-inputs text`) sees only the post text.
+  Student v2 (`--student-inputs author`, the default whenever a users file exists) also sees the cheap author
+  context the teacher saw: a MiniLM embedding of the bio (zeros if none) and a standardised scalar block
+  (log1p followers / following / tweet count / account age in days, log1p followers per following,
+  verified, has_bio) with one missing-indicator column per field that can be unknown (never NaN). Author
+  context comes from data/raw/users.jsonl (X) and data/raw/telegram_users.jsonl (Telegram: bios are not
+  fetched and there are no public counts or creation dates, so those are "unknown"). Account age is
+  measured at the time the post was written. config `student_inputs` records which student was trained.
+  The parent tweet and the author's other posts are still unseen. Identity-driven nullify labels
+  (spam_bot, shill, generic_filler, engagement_farming) are dropped from training under the default
+  `--target content` and left to the blocklist. The positive class is content-intrinsic nullify
+  (hostility, insults, FUD, rug/scam insinuations, entitled demands, sneering, ...). `--target all`
+  restores the old target.
 - Text is cleaned with gvon.classifier.content_text (leading @mention run and URLs removed), the same
   function the proxy uses at scoring time; rows with < 3 content chars (link/media-only) are skipped.
 
@@ -36,10 +44,18 @@ warning is printed.
 Weights: teacher confidence (0.5+|score-0.5|) x 1/sqrt(rows by that author), then rescaled so both
 classes carry equal total weight (no class_weight, so one prolific account cannot dominate a class).
 
+Sources: every labels file is one source. By default every data/labels/*tweets.jsonl that exists is used
+(tweets.jsonl = X, telegram_tweets.jsonl = Telegram), each joined with its raw file by prefix
+(tweets.jsonl <- data/raw/tweets.jsonl, telegram_tweets.jsonl <- data/raw/telegram.jsonl). Author ids of
+non-X sources are namespaced ("telegram:<id>") so authors of different platforms never share a group.
+config.json records the files used and per-source label counts.
+
 CLI:
-    python -m gvon.train [--labels data/labels/tweets.jsonl] [--raw data/raw/tweets.jsonl]
+    python -m gvon.train [--labels FILE [FILE ...]] [--raw FILE [FILE ...]]
+                         [--labels-dir data/labels] [--raw-dir data/raw]
                          [--out models/latest] [--threshold T] [--min-precision 0.7]
-                         [--target content|all] [--embedding-model NAME] [--no-score-weight]
+                         [--target content|all] [--student-inputs auto|text|author]
+                         [--embedding-model NAME] [--no-score-weight]
 """
 from __future__ import annotations
 
@@ -58,11 +74,22 @@ from typing import Any, Iterator
 import numpy as np
 
 from gvon import env
-from gvon.classifier import (DEFAULT_EMBEDDING_MODEL, MIN_CONTENT_CHARS, CalibratedHead, content_text, encode,
-                             load_encoder, pick_device)
+from gvon.classifier import (AUTHOR_MISSING_NAMES, AUTHOR_SCALAR_NAMES, AUTHOR_SCALER_FILE, DEFAULT_EMBEDDING_MODEL,
+                             MIN_CONTENT_CHARS, STUDENT_INPUTS_AUTHOR, STUDENT_INPUTS_TEXT, CalibratedHead,
+                             author_bio, author_from_telegram_user, author_from_x_user, author_scalar_matrix,
+                             content_text, encode, fit_author_scaler, load_encoder, parse_created_at, pick_device,
+                             scale_author_block)
 
-DEFAULT_LABELS = env.ROOT / "data" / "labels" / "tweets.jsonl"
-DEFAULT_RAW = env.ROOT / "data" / "raw" / "tweets.jsonl"
+DEFAULT_LABELS_DIR = env.ROOT / "data" / "labels"
+DEFAULT_RAW_DIR = env.ROOT / "data" / "raw"
+DEFAULT_LABELS = DEFAULT_LABELS_DIR / "tweets.jsonl"
+DEFAULT_RAW = DEFAULT_RAW_DIR / "tweets.jsonl"
+LABELS_SUFFIX = "tweets.jsonl"
+# labels-file prefix -> raw file name in the raw dir (other prefixes map to "<prefix without _>.jsonl")
+RAW_BY_PREFIX = {"": "tweets.jsonl", "telegram_": "telegram.jsonl"}
+# labels-file prefix -> author-context file next to the raw file (other prefixes: "<prefix>users.jsonl")
+USERS_BY_PREFIX = {"": "users.jsonl", "telegram_": "telegram_users.jsonl"}
+STUDENT_INPUT_CHOICES = ("auto", "text", "author")
 DEFAULT_OUT = env.ROOT / "models" / "latest"
 C_GRID: tuple[float, ...] = (0.01, 0.03, 0.1, 0.3, 1.0)
 OUTER_FOLDS = 5
@@ -78,6 +105,7 @@ BOOTSTRAP_ROUNDS = 500
 CONTENT_TAGS = frozenset({
     "hostility", "insult", "slur", "threat", "contempt", "scam_accusation", "fud", "rug_insinuation",
     "sneering", "mockery", "condescension", "doom", "baiting", "concern_trolling", "entitled_demand", "pile_on",
+    "begging", "fake_support", "scam_link",  # Telegram rubric tags: the words themselves carry them
 })
 # Nullify reasons that are about WHO posted (bot/shill/farm accounts): the blocklist's job, not the text model's.
 IDENTITY_TAGS = frozenset({"spam_bot", "shill", "generic_filler", "engagement_farming"})
@@ -100,6 +128,106 @@ def iter_jsonl(path: str | Path) -> Iterator[dict[str, Any]]:
 def load_raw_texts(path: str | Path) -> dict[str, str]:
     """id -> text from data/raw/tweets.jsonl."""
     return {str(r["id"]): str(r.get("text") or "") for r in iter_jsonl(path) if "id" in r}
+
+
+def load_raw_times(path: str | Path) -> dict[str, str]:
+    """id -> created_at (post time, for account age at posting) from a raw file."""
+    return {str(r["id"]): str(r["created_at"]) for r in iter_jsonl(path) if "id" in r and r.get("created_at")}
+
+
+def users_for(labels_path: str | Path, raw_path: str | Path) -> Path:
+    """Author-context file of a source: users.jsonl / telegram_users.jsonl next to its raw file."""
+    prefix = labels_prefix(labels_path)
+    return Path(raw_path).parent / USERS_BY_PREFIX.get(prefix, f"{prefix}users.jsonl")
+
+
+def load_users(path: str | Path, source: str) -> dict[str, dict[str, Any]]:
+    """Raw (un-namespaced) author id -> author dict {bio, followers, following, tweet_count, created_at,
+    verified}. A missing file means no author context for that source (every field unknown)."""
+    p = Path(path)
+    if not p.exists():
+        return {}
+    conv = author_from_telegram_user if source == "telegram" else author_from_x_user
+    out: dict[str, dict[str, Any]] = {}
+    for r in iter_jsonl(p):
+        a = conv(r) if r.get("id") not in (None, "") else None
+        if a is not None:
+            out[str(r["id"])] = a
+    return out
+
+
+def labels_prefix(labels_path: str | Path) -> str:
+    """'telegram_' for telegram_tweets.jsonl, '' for tweets.jsonl."""
+    name = Path(labels_path).name
+    if not name.endswith(LABELS_SUFFIX):
+        raise ValueError(f"labels file must be named <prefix>{LABELS_SUFFIX}: {labels_path}")
+    return name[: -len(LABELS_SUFFIX)]
+
+
+def source_name(labels_path: str | Path) -> str:
+    """Source of a labels file: "x" for tweets.jsonl, "telegram" for telegram_tweets.jsonl."""
+    return labels_prefix(labels_path).rstrip("_") or "x"
+
+
+def raw_for(labels_path: str | Path, raw_dir: str | Path = DEFAULT_RAW_DIR) -> Path:
+    prefix = labels_prefix(labels_path)
+    return Path(raw_dir) / RAW_BY_PREFIX.get(prefix, f"{prefix.rstrip('_')}.jsonl")
+
+
+def discover_labels(labels_dir: str | Path = DEFAULT_LABELS_DIR) -> list[Path]:
+    """Every <prefix>tweets.jsonl in labels_dir (X first), skipping _private/.hidden files."""
+    found = [p for p in Path(labels_dir).glob(f"*{LABELS_SUFFIX}")
+             if p.is_file() and not p.name.startswith(("_", "."))]
+    return sorted(found, key=lambda p: (p.name != LABELS_SUFFIX, p.name))
+
+
+def resolve_sources(labels: Any = None, raw: Any = None, labels_dir: str | Path = DEFAULT_LABELS_DIR,
+                    raw_dir: str | Path = DEFAULT_RAW_DIR) -> list[tuple[str, Path, Path]]:
+    """[(source, labels path, raw path)]. labels: path, list of paths, or None (discover in labels_dir).
+    raw: None (map each labels file by prefix into raw_dir), or one path per labels file, in order."""
+    lab = [Path(labels)] if isinstance(labels, (str, Path)) else [Path(x) for x in (labels or [])]
+    if not lab:
+        lab = discover_labels(labels_dir)
+        if not lab:
+            raise FileNotFoundError(f"no *{LABELS_SUFFIX} labels files in {labels_dir}; run `python -m gvon.label` first")
+    rw = [Path(raw)] if isinstance(raw, (str, Path)) else [Path(x) for x in (raw or [])]
+    if rw and len(rw) != len(lab):
+        raise ValueError(f"give one --raw per --labels file (got {len(rw)} raw for {len(lab)} labels), or omit --raw")
+    if not rw:
+        rw = [raw_for(p, raw_dir) for p in lab]
+    out = [(source_name(lp), lp, rp) for lp, rp in zip(lab, rw)]
+    names = [s for s, _, _ in out]
+    if len(set(names)) != len(names):
+        raise ValueError(f"two labels files map to the same source: {names}")
+    for _, lp, rp in out:
+        for f in (lp, rp):
+            if not f.exists():
+                raise FileNotFoundError(f"{f} not found")
+    return out
+
+
+def load_sources(sources: list[tuple[str, Path, Path]]) -> tuple[dict[str, dict[str, Any]], dict[str, str], dict[str, int]]:
+    """Merge every source into one (labels, raw texts) pair. Label rows get "_source", "_author" (author
+    dict from the source's users file, or None) and "_posted_at" (the post's created_at, or None), and non-X
+    author ids are namespaced "<source>:<id>" so a Telegram user can never share an author group with an X
+    account. Returns (labels, raw, label rows per source)."""
+    labels: dict[str, dict[str, Any]] = {}
+    raw: dict[str, str] = {}
+    n_rows: dict[str, int] = {}
+    for src, lp, rp in sources:
+        rows = load_labels(lp)
+        n_rows[src] = len(rows)
+        raw.update(load_raw_texts(rp))
+        times = load_raw_times(rp)
+        users = load_users(users_for(lp, rp), src)
+        for tid, row in rows.items():
+            aid = row.get("author_id")
+            row = {**row, "_source": src, "_author": users.get(str(aid)) if aid not in (None, "") else None,
+                   "_posted_at": times.get(tid)}
+            if src != "x" and aid not in (None, ""):
+                row["author_id"] = f"{src}:{aid}"
+            labels[tid] = row
+    return labels, raw, n_rows
 
 
 def load_labels(path: str | Path) -> dict[str, dict[str, Any]]:
@@ -165,6 +293,10 @@ class Dataset:
     labels: list[str]
     tags: list[str]
     counts: dict[str, int] = field(default_factory=dict)
+    sources: list[str] = field(default_factory=list)
+    author_ctx: list[dict[str, Any] | None] = field(default_factory=list)  # None = no author context
+    posted_at: list[str | None] = field(default_factory=list)
+    counts_by_source: dict[str, dict[str, int]] = field(default_factory=dict)
     unlisted_content_tags: dict[str, int] = field(default_factory=dict)
 
 
@@ -196,25 +328,38 @@ def build_dataset(labels: dict[str, dict[str, Any]], raw: dict[str, str], use_we
     labs: list[str] = []
     tags: list[str] = []
     counts: Counter[str] = Counter()
+    by_source: dict[str, Counter[str]] = defaultdict(Counter)
     unlisted: Counter[str] = Counter()
+    sources: list[str] = []
+    author_ctx: list[dict[str, Any] | None] = []
+    posted_at: list[str | None] = []
     for tid, row in labels.items():
+        src = str(row.get("_source") or "x")
+
+        def count(key: str) -> None:
+            counts[key] += 1
+            by_source[src][key] += 1
+
         text = raw.get(tid) or row.get("text") or ""
         if not text.strip():
-            counts["skipped_no_text"] += 1
+            count("skipped_no_text")
             continue
         clean = content_text(text)
         if len(clean) < MIN_CONTENT_CHARS:
-            counts["skipped_low_info"] += 1
+            count("skipped_low_info")
             continue
         lab = row["label"]
         tag = first_tag(row.get("reasons"))
         if lab == "nullify" and target == "content":
             if tag in IDENTITY_TAGS or not tag:
-                counts["skipped_identity_nullify"] += 1
+                count("skipped_identity_nullify")
                 continue
             if tag not in CONTENT_TAGS:
                 unlisted[tag] += 1
-        counts[lab] += 1
+        count(lab)
+        sources.append(src)
+        author_ctx.append(row.get("_author") if isinstance(row.get("_author"), dict) else None)
+        posted_at.append(row.get("_posted_at"))
         texts.append(clean)
         ys.append(1 if lab == "nullify" else 0)
         conf.append(confidence_weight(row.get("nullify_score")) if use_weights else 1.0)
@@ -225,7 +370,41 @@ def build_dataset(labels: dict[str, dict[str, Any]], raw: dict[str, str], use_we
     per_author = Counter(authors)
     w = np.asarray([c / np.sqrt(per_author[a]) for c, a in zip(conf, authors)], dtype=np.float64)
     return Dataset(texts=texts, y=y, w=balance_weights(w, y) if len(y) else w, groups=make_groups(authors, texts),
-                   authors=authors, labels=labs, tags=tags, counts=dict(counts), unlisted_content_tags=dict(unlisted))
+                   authors=authors, labels=labs, tags=tags, counts=dict(counts), unlisted_content_tags=dict(unlisted),
+                   sources=sources, counts_by_source={k: dict(v) for k, v in sorted(by_source.items())},
+                   author_ctx=author_ctx, posted_at=posted_at)
+
+
+def build_features(encoder: Any, ds: Dataset, use_author: bool) -> tuple[np.ndarray, Any]:
+    """(feature matrix, fitted author scaler or None) in the layout gvon.classifier.Nullifier rebuilds at
+    inference: [text embedding] (v1), or [text embedding] ++ [bio embedding, zeros if none] ++ [standardised
+    author scalars, unknown -> 0] ++ [missing indicators] (v2). Account age is taken at the post's time.
+
+    The scaler is unsupervised (mean/std of the scalar columns, no labels) and is fit once on every training
+    row, so out-of-fold rows contribute to those two statistics but never to the head or the calibrator."""
+    text_vecs = encode(encoder, ds.texts)
+    if not use_author:
+        return text_vecs, None
+    bios = [author_bio(a) for a in ds.author_ctx]
+    uniq = list(dict.fromkeys(b for b in bios if b))
+    bio_by = dict(zip(uniq, encode(encoder, uniq))) if uniq else {}
+    zero = np.zeros(text_vecs.shape[1], dtype=np.float32)
+    bio_vecs = np.vstack([bio_by[b] if b else zero for b in bios]).astype(np.float32) if bios else \
+        np.zeros((0, text_vecs.shape[1]), dtype=np.float32)
+    raw = author_scalar_matrix(ds.author_ctx, [parse_created_at(t) for t in ds.posted_at])
+    scaler = fit_author_scaler(raw)
+    return np.hstack([text_vecs, bio_vecs, scale_author_block(raw, scaler)]).astype(np.float32), scaler
+
+
+def author_coverage(ds: Dataset) -> dict[str, dict[str, int]]:
+    """Per source: training rows, rows with an author dict, rows with a non-empty bio."""
+    out: dict[str, dict[str, int]] = {}
+    for src, a in zip(ds.sources, ds.author_ctx):
+        c = out.setdefault(src, {"rows": 0, "with_author": 0, "with_bio": 0})
+        c["rows"] += 1
+        c["with_author"] += a is not None
+        c["with_bio"] += bool(author_bio(a))
+    return dict(sorted(out.items()))
 
 
 def make_head(c: float) -> Any:
@@ -422,25 +601,39 @@ def decide_threshold(cli: float | None, env_thr: float | None, oof_thr: float | 
 
 
 def train(
-    labels_path: str | Path = DEFAULT_LABELS,
-    raw_path: str | Path = DEFAULT_RAW,
+    labels_path: Any = None,
+    raw_path: Any = None,
     out_dir: str | Path = DEFAULT_OUT,
     threshold: float | None = None,
     embedding_model: str = DEFAULT_EMBEDDING_MODEL,
     use_weights: bool = True,
     min_precision: float | None = None,
     target: str = "content",
+    labels_dir: str | Path = DEFAULT_LABELS_DIR,
+    raw_dir: str | Path = DEFAULT_RAW_DIR,
+    student_inputs: str = "auto",
 ) -> dict[str, Any]:
-    """Train and write head.joblib + config.json; returns the config dict."""
+    """Train and write head.joblib + config.json (+ author_scaler.joblib for v2); returns the config dict.
+
+    labels_path: one labels file, a list of them, or None (every *tweets.jsonl in labels_dir). raw_path:
+    None (mapped by prefix into raw_dir) or one raw file per labels file. student_inputs: "text" (v1),
+    "author" (v2: text + bio + author scalars) or "auto" (v2 when any source has a users file, else v1)."""
     import joblib
 
+    if student_inputs not in STUDENT_INPUT_CHOICES:
+        raise ValueError(f"student_inputs must be one of {STUDENT_INPUT_CHOICES}")
     min_precision = min_precision_default() if min_precision is None else float(min_precision)
-    ds = build_dataset(load_labels(labels_path), load_raw_texts(raw_path), use_weights, target)
+    sources = resolve_sources(labels_path, raw_path, labels_dir, raw_dir)
+    users_files = {src: users_for(lp, rp) for src, lp, rp in sources}
+    use_author = (student_inputs == "author"
+                  or (student_inputs == "auto" and any(p.exists() for p in users_files.values())))
+    all_labels, all_raw, label_rows_by_source = load_sources(sources)
+    ds = build_dataset(all_labels, all_raw, use_weights, target)
     if len(set(ds.y.tolist())) < 2:
         raise ValueError(f"need both nullify and non-nullify examples with text; got {ds.counts}")
 
     device = pick_device()
-    x = encode(load_encoder(embedding_model, device), ds.texts)
+    x, scaler = build_features(load_encoder(embedding_model, device), ds, use_author)
 
     best_c, grid = choose_c(x, ds.y, ds.w, ds.groups)
     oof = oof_predictions(x, ds.y, ds.w, ds.groups, best_c)
@@ -483,18 +676,37 @@ def train(
         "trained_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "n_train": int(len(ds.y)),
         "n_authors": int(len(set(ds.authors))),
-        "student_inputs": ["tweet_text"],
+        "student_inputs": list(STUDENT_INPUTS_AUTHOR if use_author else STUDENT_INPUTS_TEXT),
+        "student_inputs_requested": student_inputs,
+        "feature_dim": int(x.shape[1]),
+        "author_features": ({
+            "bio": "MiniLM embedding of the whitespace-collapsed bio (L2-normalised); zeros when empty/unknown",
+            "scalars": list(AUTHOR_SCALAR_NAMES),
+            "missing_indicators": list(AUTHOR_MISSING_NAMES),
+            "scaler": AUTHOR_SCALER_FILE + " (StandardScaler over the scalars; unknown -> 0 after scaling)",
+            "account_age_reference": "post created_at at train time; scoring time at inference",
+            "users_files": {src: {"path": str(p), "exists": p.exists()} for src, p in users_files.items()},
+            "coverage_by_source": author_coverage(ds),
+        } if use_author else None),
         "probability_calibrated": calibrated,
         "text_preprocessing": "gvon.classifier.content_text (leading @mentions and URLs removed); < 3 chars skipped",
         "target": target if target == "all" else "content: nullify with a content reason tag; identity-only nullify dropped",
         "metrics": metrics,
         "label_counts": ds.counts,
+        "label_counts_by_source": ds.counts_by_source,
+        "label_sources": [{"source": src, "labels_path": str(lp), "raw_path": str(rp),
+                           "n_label_rows": label_rows_by_source.get(src, 0),
+                           "n_train": sum(1 for s in ds.sources if s == src)} for src, lp, rp in sources],
         "label_authors": label_authors,
         "top_positive_author_share": round(top[0][1] / max(1, int(ds.y.sum())), 4) if top else None,
         "unlisted_content_tags": ds.unlisted_content_tags,
         "train_device": device,
     }
     out = Path(out_dir)
+    if scaler is not None:  # written before the config that names it
+        atomic_write(out / AUTHOR_SCALER_FILE, lambda path: joblib.dump(scaler, path))
+    elif (out / AUTHOR_SCALER_FILE).exists():
+        (out / AUTHOR_SCALER_FILE).unlink()  # a v1 model must not leave a stale v2 scaler behind
     atomic_write(out / "head.joblib", lambda path: joblib.dump(final, path))
     atomic_write(out / "config.json", lambda path: Path(path).write_text(json.dumps(config, indent=2) + "\n"))
     return config
@@ -517,8 +729,12 @@ def warn_if_gated(cfg: dict[str, Any]) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m gvon.train", description=__doc__.splitlines()[0])
-    ap.add_argument("--labels", default=str(DEFAULT_LABELS))
-    ap.add_argument("--raw", default=str(DEFAULT_RAW))
+    ap.add_argument("--labels", nargs="+", action="extend", default=None,
+                    help="labels file(s) (default: every <prefix>tweets.jsonl in --labels-dir)")
+    ap.add_argument("--raw", nargs="+", action="extend", default=None,
+                    help="raw file(s), one per --labels file in order (default: mapped by prefix into --raw-dir)")
+    ap.add_argument("--labels-dir", default=str(DEFAULT_LABELS_DIR))
+    ap.add_argument("--raw-dir", default=str(DEFAULT_RAW_DIR))
     ap.add_argument("--out", default=str(DEFAULT_OUT))
     ap.add_argument("--threshold", type=float, default=None,
                     help="explicit operative threshold (default: GVON_THRESHOLD, else the OOF precision gate)")
@@ -526,16 +742,20 @@ def main(argv: list[str] | None = None) -> int:
                     help=f"OOF precision target for the learned threshold (default: GVON_MIN_PRECISION or {DEFAULT_MIN_PRECISION})")
     ap.add_argument("--target", choices=TARGETS, default="content",
                     help="content (default): identity-only nullify rows dropped; all: every nullify row is positive")
+    ap.add_argument("--student-inputs", choices=STUDENT_INPUT_CHOICES, default="auto",
+                    help="text: post text only (v1); author: text + author bio + author scalars (v2); "
+                         "auto (default): author when a users file exists for any source")
     ap.add_argument("--embedding-model", default=DEFAULT_EMBEDDING_MODEL)
     ap.add_argument("--no-score-weight", action="store_true", help="disable nullify_score confidence weighting")
     args = ap.parse_args(argv)
     cfg = train(args.labels, args.raw, args.out, args.threshold, args.embedding_model, not args.no_score_weight,
-                args.min_precision, args.target)
-    keys = ("n_train", "n_authors", "threshold", "threshold_source", "text_model_enabled", "oof_threshold",
-            "label_counts", "label_authors", "metrics")
+                args.min_precision, args.target, args.labels_dir, args.raw_dir, args.student_inputs)
+    keys = ("n_train", "n_authors", "student_inputs", "threshold", "threshold_source", "text_model_enabled", "oof_threshold",
+            "label_counts", "label_counts_by_source", "label_authors", "metrics")
     print(json.dumps({k: cfg[k] for k in keys}, indent=2))
     warn_if_gated(cfg)
-    print(f"wrote {Path(args.out) / 'head.joblib'} and {Path(args.out) / 'config.json'}")
+    extra = f", {Path(args.out) / AUTHOR_SCALER_FILE}" if cfg["author_features"] else ""
+    print(f"wrote {Path(args.out) / 'head.joblib'}{extra} and {Path(args.out) / 'config.json'}")
     return 0
 
 

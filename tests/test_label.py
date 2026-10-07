@@ -143,17 +143,55 @@ def test_outputs_match_contract_and_blocklist_only_blocks() -> None:
         {"author_id": "4", "username": "oneoff", "verdict": "block", "nullify_score": 0.7, "summary": "o",
          "tweets": [{"id": "401", "label": "nullify", "nullify_score": 0.7, "reasons": ["entitled_demand"]}]},
     ]
-    tweets, authors = label.build_output_rows(results)
+    tweets, authors = label.build_output_rows(results, policy="derived")
     assert set(tweets[0]) == {"id", "author_id", "author_username", "label", "nullify_score", "reasons"}
     assert set(authors[0]) == {"author_id", "username", "verdict", "nullify_score", "n_tweets", "summary",
-                               "teacher_verdict", "teacher_nullify_score"}
+                               "teacher_verdict", "teacher_nullify_score", "derived_verdict", "derived_nullify_score",
+                               "verdict_policy", "platform"}
     by = {a["username"]: a for a in authors}
     assert by["spammer"]["verdict"] == "block" and by["spammer"]["nullify_score"] == 0.85
     assert by["oneoff"]["verdict"] == "watch" and by["oneoff"]["teacher_verdict"] == "block"
+    assert by["oneoff"]["derived_verdict"] == "watch" and by["oneoff"]["verdict_policy"] == "derived"
     bl = label.build_blocklist(authors, HANDLE, NOW)
     assert bl == {"generated_at": "2026-10-06T00:00:00Z", "handle": HANDLE,
-                  "accounts": [{"id": "2", "username": "spammer", "nullify_score": 0.85, "summary": "s"}]}
+                  "accounts": [{"id": "2", "username": "spammer", "nullify_score": 0.85, "summary": "s", "platform": "x"}]}
     assert [a["username"] for a in label.build_blocklist(authors, HANDLE, NOW, "watch")["accounts"]] == ["oneoff"]
+
+
+def test_teacher_policy_is_default_and_makes_teacher_verdict_operative() -> None:
+    one_scam = {"author_id": "4", "username": "oneoff", "verdict": "block", "nullify_score": 0.8, "summary": "o",
+                "tweets": [{"id": "401", "label": "nullify", "nullify_score": 0.8, "reasons": ["scam_accusation"]},
+                           {"id": "402", "label": "neutral", "nullify_score": 0.1, "reasons": ["info"]}]}
+    _, authors = label.build_output_rows([one_scam])  # default policy
+    a = authors[0]
+    assert label.DEFAULT_VERDICT_POLICY == "teacher"
+    assert (a["verdict"], a["nullify_score"], a["verdict_policy"]) == ("block", 0.8, "teacher")
+    assert (a["derived_verdict"], a["derived_nullify_score"]) == ("watch", 0.45)
+    assert [x["id"] for x in label.build_blocklist(authors, HANDLE, NOW)["accounts"]] == ["4"]
+    # the stored row can be flipped either way without a relabel
+    assert label.apply_policy(a, "derived")["verdict"] == "watch"
+    assert label.apply_policy(label.apply_policy(a, "derived"), "teacher")["verdict"] == "block"
+    with pytest.raises(ValueError):
+        label.build_output_rows([one_scam], policy="lenient")
+
+
+def test_resolve_verdict_policy_cli_env_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GVON_VERDICT_POLICY", "")
+    assert label.resolve_verdict_policy(None) == "teacher"
+    monkeypatch.setenv("GVON_VERDICT_POLICY", "Derived")
+    assert label.resolve_verdict_policy(None) == "derived"
+    assert label.resolve_verdict_policy("teacher") == "teacher"
+    monkeypatch.setenv("GVON_VERDICT_POLICY", "nonsense")
+    with pytest.raises(ValueError):
+        label.resolve_verdict_policy(None)
+
+
+def test_author_rubric_allows_single_scam_accusation_block() -> None:
+    for platform in ("x", "telegram"):
+        sp = label.system_prompt(HANDLE, platform)
+        assert "ONE tweet is enough" in sp or "ONE message is enough" in sp
+        assert "scam or\n  rug accusation" in sp
+        assert "one tweet is not enough evidence" not in sp
 
 
 def _t(i: str, lab: str, score: float, tag: str) -> dict:
@@ -241,6 +279,7 @@ def test_end_to_end_with_stub_teacher_caches_and_reasks(tmp_path: Path, monkeypa
     monkeypatch.setattr(label, "make_teacher", lambda backend, model: stub)
     monkeypatch.setattr(label.shutil, "which", lambda name: "/synthetic/bin/claude")
     monkeypatch.setenv("GVON_HANDLE", HANDLE)
+    monkeypatch.setenv("GVON_VERDICT_POLICY", "")
     args = ["--raw", str(tmp_path / "raw"), "--out", str(tmp_path / "labels"), "--blocklist", str(tmp_path / "bl.json"),
             "--handle", HANDLE, "--workers", "1", "--model", "m", "--backend", "claude-cli"]
     assert label.main(args) == 0
@@ -282,3 +321,153 @@ def test_failure_fraction_controls_exit_code(tmp_path: Path, monkeypatch: pytest
             "--handle", HANDLE, "--workers", "1", "--model", "m", "--batch-authors", "1"]
     assert label.main(args) == 1  # author 2 = 2 of 4 tweets failed (50%) > 10%
     assert label.main(args + ["--max-failure-frac", "1.0"]) == 0
+
+
+# --------------------------------------------------------------------------- sources (x / telegram / all)
+
+
+def tg(i: str, author: str | None, text: str, kind: str, reply_to: str | None = None, uname: str | None = None,
+       chat: str = "-1001", title: str = "Synthetic Builders Chat", ctype: str = "supergroup") -> dict:
+    return {"id": f"{chat}:{i}", "text": text, "author_id": author, "author_username": uname, "author_name": f"Name {author}",
+            "created_at": f"2026-10-0{int(i) % 5 + 1}T00:00:00Z", "conversation_id": chat,
+            "in_reply_to_user_id": None, "lang": None, "kind": kind,
+            "referenced": [{"type": "replied_to", "id": f"{chat}:{reply_to}"}] if reply_to else [],
+            "public_metrics": {}, "platform": "telegram", "chat_title": title, "chat_type": ctype, "media": None}
+
+
+def write_telegram_raw(d: Path) -> None:
+    rows = [
+        tg("10", "500", "shipping the router today", "own", uname="tgbuilder"),
+        tg("11", "501", "this is a rug, devs will dump", "group_reply", reply_to="10", uname="synth_fudder"),
+        tg("1", "502", "sir please send 50 usdt sir", "dm", chat="502", title="Synthetic Beggar", ctype="private"),
+        tg("12", "503", "", "group_mention", uname=None),
+    ]
+    rows[3]["media"] = "photo"
+    users = [
+        {"id": "500", "username": "tgbuilder", "name": "Builder", "description": None, "platform": "telegram", "is_self": True},
+        {"id": "501", "username": "synth_fudder", "name": "Fudder", "description": None, "platform": "telegram", "scam": True},
+        {"id": "502", "username": None, "name": "Beggar", "description": None, "platform": "telegram"},
+        {"id": "503", "username": None, "name": "Photo", "description": None, "platform": "telegram"},
+    ]
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "telegram.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    (d / "telegram_users.jsonl").write_text("".join(json.dumps(r) + "\n" for r in users))
+    (d / "telegram_context.jsonl").write_text("")
+
+
+def _echo_teacher(seen: list[tuple[str, str]], nullify_ids: set[str], verdicts: dict[str, str] | None = None):
+    def stub(system: str, user: str) -> dict:
+        seen.append((system, user))
+        body = json.loads(user.split("<engagements>\n", 1)[1].split("\n</engagements>", 1)[0])
+        out = []
+        for a in body["authors"]:
+            nul = a["author_id"] in nullify_ids
+            out.append({"author_id": a["author_id"], "username": a["username"],
+                        "verdict": (verdicts or {}).get(a["author_id"], "block" if nul else "allow"),
+                        "nullify_score": 0.9 if nul else 0.1, "summary": "sum",
+                        "tweets": [{"id": t["id"], "label": "nullify" if nul else "neutral",
+                                    "nullify_score": 0.9 if nul else 0.1,
+                                    "reasons": ["scam_accusation" if nul else "off_topic"]} for t in a["tweets"]]})
+        return {"authors": out}
+    return stub
+
+
+def _args(tmp_path: Path, *extra: str) -> list[str]:
+    return ["--raw", str(tmp_path / "raw"), "--out", str(tmp_path / "labels"), "--blocklist", str(tmp_path / "bl.json"),
+            "--handle", HANDLE, "--workers", "1", "--model", "m", "--backend", "claude-cli", *extra]
+
+
+@pytest.fixture()
+def stub_env(monkeypatch: pytest.MonkeyPatch) -> pytest.MonkeyPatch:
+    monkeypatch.setattr(label.shutil, "which", lambda name: "/synthetic/bin/claude")
+    for k in ("GVON_VERDICT_POLICY", "GVON_TG_HANDLE"):
+        monkeypatch.setenv(k, "")
+    return monkeypatch
+
+
+def test_telegram_source_labels_with_chat_context_and_platform(tmp_path: Path, stub_env: pytest.MonkeyPatch) -> None:
+    write_telegram_raw(tmp_path / "raw")
+    seen: list[tuple[str, str]] = []
+    stub_env.setattr(label, "make_teacher", lambda b, m: _echo_teacher(seen, {"501", "502"}))
+    assert label.main(_args(tmp_path, "--source", "telegram")) == 0
+    system, user = seen[0]
+    assert "Telegram" in system and "sir please" in system and "fake-support" in system
+    assert "wallet-drainer" in system and "pile-on" in system
+    assert "@tgbuilder" in system  # handle = the logged-in account (is_self), not the X handle
+    body = json.loads(user.split("<engagements>\n", 1)[1].split("\n</engagements>", 1)[0])
+    by = {a["author_id"]: a for a in body["authors"]}
+    assert set(by) == {"501", "502", "503"}  # own messages excluded
+    fud = by["501"]["tweets"][0]
+    assert fud["chat_title"] == "Synthetic Builders Chat" and fud["chat_type"] == "supergroup"
+    assert fud["context"] == ["replying to @tgbuilder: shipping the router today"]
+    assert by["501"]["is_scam"] is True and "followers" not in by["501"]
+    assert by["502"]["username"] == "" and by["502"]["tweets"][0]["chat_type"] == "private"
+    assert by["503"]["tweets"][0]["text"] == "[photo without text]"
+
+    labels_dir = tmp_path / "labels"
+    assert (labels_dir / "telegram_tweets.jsonl").exists() and (labels_dir / "telegram_authors.jsonl").exists()
+    assert (labels_dir / "_telegram_cache.jsonl").exists() and not (labels_dir / "_cache.jsonl").exists()
+    assert not (labels_dir / "tweets.jsonl").exists()
+    authors = [json.loads(l) for l in (labels_dir / "telegram_authors.jsonl").read_text().splitlines()]
+    assert {a["platform"] for a in authors} == {"telegram"}
+    tweet_ids = {json.loads(l)["id"] for l in (labels_dir / "telegram_tweets.jsonl").read_text().splitlines()}
+    assert tweet_ids == {"-1001:11", "502:1", "-1001:12"}
+    bl = json.loads((tmp_path / "bl.json").read_text())
+    assert sorted((a["id"], a["platform"]) for a in bl["accounts"]) == [("501", "telegram"), ("502", "telegram")]
+
+
+def test_source_x_run_keeps_telegram_accounts_in_blocklist(tmp_path: Path, stub_env: pytest.MonkeyPatch) -> None:
+    write_raw(tmp_path / "raw")
+    write_telegram_raw(tmp_path / "raw")
+    seen: list[tuple[str, str]] = []
+    stub_env.setattr(label, "make_teacher", lambda b, m: _echo_teacher(seen, {"2", "501"}))
+    assert label.main(_args(tmp_path, "--source", "telegram")) == 0
+    seen.clear()
+    assert label.main(_args(tmp_path, "--source", "x")) == 0
+    assert seen and all("X (Twitter)" in s for s, _ in seen)
+    bl = json.loads((tmp_path / "bl.json").read_text())
+    assert sorted((a["id"], a["platform"]) for a in bl["accounts"]) == [("2", "x"), ("501", "telegram")]
+    # --rebuild-only --source all under the derived policy re-applies the policy to both sources
+    seen.clear()
+    assert label.main(_args(tmp_path, "--rebuild-only", "--verdict-policy", "derived")) == 0
+    assert seen == []
+    bl = json.loads((tmp_path / "bl.json").read_text())
+    # author 2: 2/2 nullify -> block either way; author 501: one 0.9 scam_accusation -> derived watch
+    assert sorted((a["id"], a["platform"]) for a in bl["accounts"]) == [("2", "x")]
+    wl = json.loads((tmp_path / "watchlist.json").read_text())
+    assert [(a["id"], a["platform"]) for a in wl["accounts"]] == [("501", "telegram")]
+
+
+def test_source_all_labels_every_source_with_data(tmp_path: Path, stub_env: pytest.MonkeyPatch) -> None:
+    write_raw(tmp_path / "raw")
+    seen: list[tuple[str, str]] = []
+    stub_env.setattr(label, "make_teacher", lambda b, m: _echo_teacher(seen, set()))
+    assert label.main(_args(tmp_path)) == 0  # default --source all: no telegram raw -> skipped, not an error
+    assert seen and all("Telegram" not in s.split("\n", 1)[0] for s, _ in seen)
+    assert (tmp_path / "labels" / "tweets.jsonl").exists()
+    assert not (tmp_path / "labels" / "telegram_tweets.jsonl").exists()
+    write_telegram_raw(tmp_path / "raw")
+    seen.clear()
+    assert label.main(_args(tmp_path)) == 0  # X is cached now; only telegram authors are sent
+    assert seen and all("Telegram filter" in s for s, _ in seen)
+    assert (tmp_path / "labels" / "telegram_tweets.jsonl").exists()
+
+
+def test_explicit_source_without_raw_fails(tmp_path: Path, stub_env: pytest.MonkeyPatch,
+                                           capsys: pytest.CaptureFixture[str]) -> None:
+    write_raw(tmp_path / "raw")
+    assert label.main(_args(tmp_path, "--source", "telegram")) == 2
+    assert "gvon.telegram_ingest" in capsys.readouterr().err
+    assert label.main(_args(tmp_path, "--source", "x", "--dry-run")) == 0
+
+
+def test_telegram_cache_key_differs_from_x() -> None:
+    assert label.cache_key("2", ["a"], "m") == label.cache_key("2", ["a"], "m", "x")
+    assert label.cache_key("2", ["a"], "m") != label.cache_key("2", ["a"], "m", "telegram")
+
+
+def test_reconcile_never_matches_empty_usernames_by_name() -> None:
+    payload = {"author_id": "7", "username": "", "tweets": [{"id": "c:1"}]}
+    wrong = {"authors": [{"author_id": "8", "username": "", "verdict": "allow", "nullify_score": 0, "summary": "",
+                          "tweets": [{"id": "c:1", "label": "good", "nullify_score": 0, "reasons": []}]}]}
+    assert label.reconcile(wrong, [payload])[1] == [payload]

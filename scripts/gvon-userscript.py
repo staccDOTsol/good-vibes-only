@@ -100,6 +100,8 @@ def load_usernames(path: Path) -> list[str]:
     data = json.loads(path.read_text() or "{}")
     names: set[str] = set()
     for acct in data.get("accounts") or []:
+        if (acct or {}).get("platform", "x") != "x":  # Telegram entries never apply to x.com
+            continue
         name = str((acct or {}).get("username") or "").strip().lstrip("@")
         if USERNAME_RE.match(name):
             names.add(name.lower())

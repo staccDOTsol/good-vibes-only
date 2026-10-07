@@ -48,7 +48,8 @@ Prerequisites:
 ```sh
 cp .env.example .env          # fill in X_BEARER_TOKEN and GVON_HANDLE (your handle, no @)
 make setup                    # uv venv (Python 3.12) + pip install -e ".[dev]"
-make all                      # ingest -> label -> train   (same as scripts/run-all.sh)
+make all                      # X ingest -> Telegram ingest (if configured) -> label -> train
+                              #   (same as scripts/run-all.sh)
 # trust the mitmproxy CA once: see docs/NULLIFIER.md section 2
 make proxy                    # mitmproxy nullifier on port 8080
 ```
@@ -62,11 +63,26 @@ Then launch a browser profile that uses the proxy, so only that profile is filte
 
 Log in to x.com in that window. Pruned posts are logged in the proxy terminal as `gvon: pruned ...`.
 
+Telegram can feed the same teacher and student. Put `TG_API_ID` / `TG_API_HASH` (from my.telegram.org)
+in `.env`, run `make telegram-login` once yourself (it asks for your phone number and the login code),
+then `make telegram-ingest` pulls a week of DMs, replies and mentions into `data/raw/telegram.jsonl`.
+`make label` labels every source that has data (`--source x|telegram|all`), and `make train` trains on
+every labels file. The blocklist then holds X and Telegram accounts, each tagged with its `platform`.
+`make all` (and `scripts/run-all.sh`) runs the Telegram ingest step only when `TG_API_ID`, `TG_API_HASH`
+and a session (`data/telegram.session` or `TG_SESSION`) are all present. Otherwise it prints which one is
+missing, skips Telegram and carries on with X only. It also skips the Telegram pull while the sink
+(`make telegram`) is running, because one Telegram session cannot serve two processes: stop the sink, run
+`make telegram-ingest`, then restart it. `make telegram` runs the Telegram sink ([docs/TELEGRAM.md](docs/TELEGRAM.md)).
+
 Other targets:
 
 | target | what it does |
 | --- | --- |
 | `make ingest` / `make label` / `make train` | run one stage |
+| `make telegram-login` | one-time interactive Telegram login (you run it; phone + code) -> `data/telegram.session` |
+| `make telegram-ingest` | pull a week of Telegram DMs / replies / mentions -> `data/raw/telegram*.jsonl` |
+| `make telegram` | the Telegram sink: deletes, mutes or archives nullified incoming messages |
+| `make telegram-vault N=20` | print the last N messages the Telegram sink nullified, to audit false positives |
 | `make test` | full pytest suite (synthetic data only) |
 | `make proxy-record` | proxy with `GVON_RECORD=1`: saves matched response bodies to `data/recordings/` |
 | `make userscript` | writes `dist/gvon.user.js`, a blocklist-only fallback for Tampermonkey/Violentmonkey |
@@ -92,6 +108,30 @@ Stages are resumable:
   labeled. Re-run once the problem is fixed. Because a recent completed ingest is reused, re-running
   `make all` after a later stage failed costs no X API reads.
 
+## Apply it everywhere
+
+The student model is platform-agnostic. `gvon.classifier.Nullifier` takes a post's text and, for the v2
+student, an optional author dict (`bio`, `followers`, `following`, `tweet_count`, `created_at`, `verified`,
+any of them missing). It has no idea which app the text came from. Training pools every labelled source
+(`data/labels/tweets.jsonl` from X, `data/labels/telegram_tweets.jsonl` from Telegram), so one
+`models/latest/` and one blocklist serve every sink. Each blocklist account carries a `platform`, and a
+sink can scope identity matches to its own platform by passing `platform=` to `should_nullify`.
+
+| sink | how it runs | what it can do | what it cannot do |
+| --- | --- | --- | --- |
+| x.com proxy (`gvon/nullifier.py`, `make proxy`) | mitmproxy addon between your browser and x.com | removes nullified posts from timeline, search, profile and conversation JSON before the browser renders them; uses the blocklist, the watchlist and the student (text plus author context) | native X apps (certificate pinning), DMs, Spaces and WebSocket traffic; needs a trusted local CA; scores text only on posts that engage you unless `GVON_TEXT_SCOPE=all`; passes no `platform`, so a blocked Telegram username also hides an X account with the same username |
+| x.com userscript (`dist/gvon.user.js`, `make userscript`) | Tampermonkey / Violentmonkey in any browser | hides posts by blocklisted usernames after x.com renders them; no CA, no proxy, no Python at runtime | runs no classifier, so no per-post text scoring; posts are still downloaded and can flash before they are hidden; matches usernames only; must be regenerated after the blocklist changes; bakes in every blocklist username, Telegram ones included |
+| Telegram sink (`gvon/telegram_nullifier.py`, `make telegram`) | a second Telegram client logged in as you (Telethon) | scores every incoming message with the same Nullifier (`platform="telegram"`); deletes it for you in DMs and basic groups (no read receipt is sent), mutes or archives the chat, or deletes it for everyone in groups (never broadcast channels) where you are an admin and enable it; keeps every nullified message in a local vault, attachments downloaded before any delete (a message whose attachment cannot be saved is only logged); never acts on Telegram's service account 777000, support accounts or `GVON_TG_ALLOW` senders | stop delivery: your other devices receive the message, and may show a push notification, before the sink acts; delete for you in supergroups or channels (it mutes instead); act while it is not running (`--backfill N` catches up on unread messages); score media without a caption or re-score edits |
+
+**Adding a sink.** A new platform needs two pieces. First, an ingest module that writes the platform's
+recent engagement in the same JSONL shape as `data/raw/tweets.jsonl`, plus a users file and a context file
+(see [CONTRACT.md](CONTRACT.md); `gvon/telegram_ingest.py` is the worked example). Give rows a
+`platform` key, register the source in `gvon/label.py` (a `SourceSpec` entry naming its raw, users and
+context files, plus a rubric note for the teacher), and name its labels `data/labels/<prefix>_tweets.jsonl`
+with raw rows in `data/raw/<prefix>.jsonl`, which `train` discovers on its own. Second, a sink that sees each item before
+you do and calls `Nullifier.should_nullify(text, author_id=..., username=..., platform=..., author=...)`, then
+hides, deletes or mutes whatever returns True. Nothing in the classifier needs to change.
+
 ## Honest limitations
 
 - **HTTPS means per-post filtering needs a trusted local CA.** The proxy has to decrypt x.com's TLS to
@@ -105,12 +145,17 @@ Stages are resumable:
   ingest stops with a partial dataset.
 - **The search window is 7 days.** Recent search only reaches back one week, so the training set is
   whatever happened to you that week.
-- **The teacher sees more than the student.** The teacher judged each post with the author's bio, account
-  age, follower counts, the parent tweet and everything else that author posted. The local model sees only
-  the post text (`student_inputs` in `models/latest/config.json`). Bot, shill and copy-paste spam is
-  therefore caught by the blocklist, not the model. Training drops nullify labels whose reason is
-  identity-based (`spam_bot`, `shill`, `generic_filler`, `engagement_farming`) and learns only from
-  content reasons such as hostility, insults, FUD, rug or scam insinuations, entitled demands and
+- **The teacher still sees more than the student.** The teacher judged each post with the author's bio,
+  account age, follower counts, the parent tweet and everything else that author posted. The default
+  student (v2) sees the post text plus the cheap part of that context: the bio, follower, following and
+  post counts, account age and the verified flag, from `data/raw/users.jsonl` at training time and from the
+  timeline JSON at filtering time. It never sees the parent post or the author's other posts.
+  `python -m gvon.train --student-inputs text` trains the text-only v1 student instead. `student_inputs` in
+  `models/latest/config.json` says which one is installed. Telegram has no public follower counts or
+  account age. The Telegram sink fetches a sender's bio once per sender (one `GetFullUser` call, cached for
+  a day). Bot, shill and copy-paste spam is still left to the blocklist: training drops nullify labels whose
+  reason is identity-based (`spam_bot`, `shill`, `generic_filler`, `engagement_farming`) and learns only
+  from content reasons such as hostility, insults, FUD, rug or scam insinuations, entitled demands and
   sneering.
 - **The classifier is only as good as your labeled week.** The student learns from a few hundred
   teacher-labelled posts. It inherits the teacher's judgment calls and that week's topics, and it will
@@ -126,10 +171,14 @@ Stages are resumable:
   replies to you, mentions you or quotes you, because that is all the model was trained on. Every other
   post (home timeline, search, profiles) is checked against the blocklist only. `GVON_TEXT_SCOPE=all`
   scores everything. False positives there have not been measured.
-- **Authors get three tiers.** `block` (data/blocklist.json) needs at least two nullify posts that make up
-  most of what the author posted, or one severe hit. A single ordinary hit is `watch`
-  (data/watchlist.json). Watch-listed authors get a threshold lowered by `GVON_WATCH_DELTA` (default
-  0.15). Any author whose running mean over 3 or more distinct posts reaches the threshold is hidden.
+- **Authors get three tiers, and the teacher decides them.** By default (`GVON_VERDICT_POLICY=teacher`)
+  the frontier teacher's per-author verdict is operative, so one scam accusation can put an account on
+  `block` (data/blocklist.json); `watch` (data/watchlist.json) is for mixed accounts and single mild hits.
+  `GVON_VERDICT_POLICY=derived` (or `make label LABEL_ARGS="--rebuild-only --verdict-policy derived"`)
+  switches to a stricter code rule: at least two nullify posts that make up most of what the author
+  posted, or one severe hit. Both verdicts are stored in authors.jsonl, so switching needs no relabel.
+  Watch-listed authors get a threshold lowered by `GVON_WATCH_DELTA` (default 0.15). Any author whose
+  running mean over 3 or more distinct posts reaches the threshold is hidden.
 - X changes its web client often. The pruner is structure-agnostic and passes a response through
   untouched if anything goes wrong, so expect some misses rather than broken pages. DMs, Spaces,
   WebSocket traffic and the native apps are not filtered.
