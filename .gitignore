@@ -8,9 +8,13 @@ models/
 .venv/
 __pycache__/
 *.pyc
+*.egg-info/
+build/
 .pytest_cache/
 .mypy_cache/
 # mitmproxy
 .mitmproxy/
 # os
 .DS_Store
+# generated userscript (contains blocklisted usernames)
+dist/

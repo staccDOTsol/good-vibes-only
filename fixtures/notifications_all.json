@@ -1,0 +1,293 @@
+{
+  "_gvon_fixture": "SYNTHETIC fixture: hand-written to mimic x.com response shapes. Not real X data; all handles are fake.",
+  "globalObjects": {
+    "users": {
+      "900000000000000001": {
+        "id": 900000000000000001,
+        "id_str": "900000000000000001",
+        "name": "synthetic_owner",
+        "screen_name": "synthetic_owner"
+      },
+      "900000000000000021": {
+        "id": 900000000000000021,
+        "id_str": "900000000000000021",
+        "name": "synthetic_hater_1",
+        "screen_name": "synthetic_hater_1"
+      },
+      "900000000000000011": {
+        "id": 900000000000000011,
+        "id_str": "900000000000000011",
+        "name": "synthetic_friend_1",
+        "screen_name": "synthetic_friend_1"
+      },
+      "900000000000000022": {
+        "id": 900000000000000022,
+        "id_str": "900000000000000022",
+        "name": "synthetic_hater_2",
+        "screen_name": "synthetic_hater_2"
+      }
+    },
+    "tweets": {
+      "8001": {
+        "id": 8001,
+        "id_str": "8001",
+        "full_text": "my post people liked",
+        "user_id": 900000000000000001,
+        "user_id_str": "900000000000000001",
+        "created_at": "Mon Oct 05 12:00:00 +0000 2026"
+      },
+      "8002": {
+        "id": 8002,
+        "id_str": "8002",
+        "full_text": "@synthetic_owner bad reply",
+        "user_id": 900000000000000021,
+        "user_id_str": "900000000000000021",
+        "created_at": "Mon Oct 05 12:00:00 +0000 2026"
+      },
+      "8003": {
+        "id": 8003,
+        "id_str": "8003",
+        "full_text": "@synthetic_owner nice reply",
+        "user_id": 900000000000000011,
+        "user_id_str": "900000000000000011",
+        "created_at": "Mon Oct 05 12:00:00 +0000 2026"
+      }
+    },
+    "notifications": {
+      "n1": {
+        "id": "n1",
+        "timestampMs": "1790000000000",
+        "icon": {
+          "id": "heart_icon"
+        },
+        "message": {
+          "text": "2 people liked your post",
+          "entities": []
+        },
+        "template": {
+          "aggregateUserActionsV1": {
+            "targetObjects": [
+              {
+                "tweet": {
+                  "id": "8001"
+                }
+              }
+            ],
+            "fromUsers": [
+              {
+                "user": {
+                  "id": "900000000000000021"
+                }
+              },
+              {
+                "user": {
+                  "id": "900000000000000011"
+                }
+              }
+            ]
+          }
+        }
+      },
+      "n2": {
+        "id": "n2",
+        "timestampMs": "1790000000000",
+        "icon": {
+          "id": "heart_icon"
+        },
+        "message": {
+          "text": "1 person liked your post",
+          "entities": []
+        },
+        "template": {
+          "aggregateUserActionsV1": {
+            "targetObjects": [
+              {
+                "tweet": {
+                  "id": "8001"
+                }
+              }
+            ],
+            "fromUsers": [
+              {
+                "user": {
+                  "id": "900000000000000022"
+                }
+              }
+            ]
+          }
+        }
+      },
+      "n3": {
+        "id": "n3",
+        "timestampMs": "1790000000000",
+        "icon": {
+          "id": "person_icon"
+        },
+        "message": {
+          "text": "synthetic_friend_1 followed you",
+          "entities": []
+        },
+        "template": {
+          "aggregateUserActionsV1": {
+            "targetObjects": [],
+            "fromUsers": [
+              {
+                "user": {
+                  "id": "900000000000000011"
+                }
+              }
+            ]
+          }
+        }
+      }
+    }
+  },
+  "timeline": {
+    "id": "Notifications-SYNTHETIC",
+    "instructions": [
+      {
+        "clearCache": {}
+      },
+      {
+        "addEntries": {
+          "entries": [
+            {
+              "entryId": "cursor-top-1790000000009",
+              "sortIndex": "1790000000009",
+              "content": {
+                "entryType": "TimelineTimelineCursor",
+                "__typename": "TimelineTimelineCursor",
+                "value": "SYNTHETIC_N_TOP",
+                "cursorType": "Top"
+              }
+            },
+            {
+              "entryId": "notification-n1",
+              "sortIndex": "1790000000008",
+              "content": {
+                "item": {
+                  "content": {
+                    "notification": {
+                      "id": "n1",
+                      "url": {
+                        "urlType": "UrtEndpoint",
+                        "url": "/2/notifications/x.json"
+                      },
+                      "fromUsers": [
+                        "900000000000000021",
+                        "900000000000000011"
+                      ]
+                    }
+                  },
+                  "clientEventInfo": {
+                    "component": "urt",
+                    "element": "user_liked_multiple_tweets"
+                  }
+                }
+              }
+            },
+            {
+              "entryId": "notification-n2",
+              "sortIndex": "1790000000007",
+              "content": {
+                "item": {
+                  "content": {
+                    "notification": {
+                      "id": "n2",
+                      "url": {
+                        "urlType": "UrtEndpoint",
+                        "url": "/2/notifications/x.json"
+                      },
+                      "fromUsers": [
+                        "900000000000000022"
+                      ]
+                    }
+                  },
+                  "clientEventInfo": {
+                    "component": "urt",
+                    "element": "user_liked_multiple_tweets"
+                  }
+                }
+              }
+            },
+            {
+              "entryId": "notification-n3",
+              "sortIndex": "1790000000006",
+              "content": {
+                "item": {
+                  "content": {
+                    "notification": {
+                      "id": "n3",
+                      "url": {
+                        "urlType": "UrtEndpoint",
+                        "url": "/2/notifications/x.json"
+                      },
+                      "fromUsers": [
+                        "900000000000000011"
+                      ]
+                    }
+                  },
+                  "clientEventInfo": {
+                    "component": "urt",
+                    "element": "user_liked_multiple_tweets"
+                  }
+                }
+              }
+            },
+            {
+              "entryId": "notification-t8002",
+              "sortIndex": "1790000000005",
+              "content": {
+                "item": {
+                  "content": {
+                    "tweet": {
+                      "id": "8002",
+                      "displayType": "Tweet"
+                    }
+                  },
+                  "clientEventInfo": {
+                    "component": "urt",
+                    "element": "user_replied_to_your_tweet"
+                  }
+                }
+              }
+            },
+            {
+              "entryId": "notification-t8003",
+              "sortIndex": "1790000000004",
+              "content": {
+                "item": {
+                  "content": {
+                    "tweet": {
+                      "id": "8003",
+                      "displayType": "Tweet"
+                    }
+                  },
+                  "clientEventInfo": {
+                    "component": "urt",
+                    "element": "user_replied_to_your_tweet"
+                  }
+                }
+              }
+            },
+            {
+              "entryId": "cursor-bottom-1790000000000",
+              "sortIndex": "1790000000000",
+              "content": {
+                "entryType": "TimelineTimelineCursor",
+                "__typename": "TimelineTimelineCursor",
+                "value": "SYNTHETIC_N_BOTTOM",
+                "cursorType": "Bottom"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "markEntriesUnreadGreaterThanSortIndex": {
+          "sortIndex": "1790000000005"
+        }
+      }
+    ]
+  }
+}

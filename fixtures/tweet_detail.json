@@ -1,0 +1,285 @@
+{
+  "_gvon_fixture": "SYNTHETIC fixture: hand-written to mimic x.com response shapes. Not real X data; all handles are fake.",
+  "data": {
+    "threaded_conversation_with_injections_v2": {
+      "instructions": [
+        {
+          "type": "TimelineAddEntries",
+          "entries": [
+            {
+              "entryId": "tweet-5000",
+              "sortIndex": "7999",
+              "content": {
+                "entryType": "TimelineTimelineItem",
+                "__typename": "TimelineTimelineItem",
+                "itemContent": {
+                  "itemType": "TimelineTweet",
+                  "__typename": "TimelineTweet",
+                  "tweet_results": {
+                    "result": {
+                      "__typename": "Tweet",
+                      "rest_id": "5000",
+                      "core": {
+                        "user_results": {
+                          "result": {
+                            "__typename": "User",
+                            "id": "VXNlcjo900000000000000001",
+                            "rest_id": "900000000000000001",
+                            "legacy": {
+                              "screen_name": "synthetic_owner",
+                              "name": "Synthetic Owner",
+                              "followers_count": 10
+                            }
+                          }
+                        }
+                      },
+                      "legacy": {
+                        "id_str": "5000",
+                        "full_text": "my post quoting a hater",
+                        "user_id_str": "900000000000000001",
+                        "favorite_count": 1,
+                        "reply_count": 0,
+                        "retweet_count": 0,
+                        "lang": "en",
+                        "is_quote_status": true
+                      },
+                      "quoted_status_result": {
+                        "result": {
+                          "__typename": "Tweet",
+                          "rest_id": "5999",
+                          "core": {
+                            "user_results": {
+                              "result": {
+                                "__typename": "User",
+                                "id": "VXNlcjo900000000000000021",
+                                "rest_id": "900000000000000021",
+                                "legacy": {
+                                  "screen_name": "synthetic_hater_1",
+                                  "name": "Synthetic Hater 1",
+                                  "followers_count": 10
+                                }
+                              }
+                            }
+                          },
+                          "legacy": {
+                            "id_str": "5999",
+                            "full_text": "the quoted hater post",
+                            "user_id_str": "900000000000000021",
+                            "favorite_count": 1,
+                            "reply_count": 0,
+                            "retweet_count": 0,
+                            "lang": "en"
+                          }
+                        }
+                      }
+                    }
+                  },
+                  "tweetDisplayType": "Tweet"
+                }
+              }
+            },
+            {
+              "entryId": "conversationthread-5001",
+              "sortIndex": "7998",
+              "content": {
+                "entryType": "TimelineTimelineModule",
+                "__typename": "TimelineTimelineModule",
+                "items": [
+                  {
+                    "entryId": "conversationthread-5001-tweet-5011",
+                    "item": {
+                      "itemContent": {
+                        "itemType": "TimelineTweet",
+                        "__typename": "TimelineTweet",
+                        "tweet_results": {
+                          "result": {
+                            "__typename": "Tweet",
+                            "rest_id": "5011",
+                            "core": {
+                              "user_results": {
+                                "result": {
+                                  "__typename": "User",
+                                  "id": "VXNlcjo900000000000000022",
+                                  "rest_id": "900000000000000022",
+                                  "legacy": {
+                                    "screen_name": "synthetic_hater_2",
+                                    "name": "Synthetic Hater 2",
+                                    "followers_count": 10
+                                  }
+                                }
+                              }
+                            },
+                            "legacy": {
+                              "id_str": "5011",
+                              "full_text": "bad reply",
+                              "user_id_str": "900000000000000022",
+                              "favorite_count": 1,
+                              "reply_count": 0,
+                              "retweet_count": 0,
+                              "lang": "en"
+                            }
+                          }
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "entryId": "conversationthread-5001-tweet-5012",
+                    "item": {
+                      "itemContent": {
+                        "itemType": "TimelineTweet",
+                        "__typename": "TimelineTweet",
+                        "tweet_results": {
+                          "result": {
+                            "__typename": "Tweet",
+                            "rest_id": "5012",
+                            "core": {
+                              "user_results": {
+                                "result": {
+                                  "__typename": "User",
+                                  "id": "VXNlcjo900000000000000011",
+                                  "rest_id": "900000000000000011",
+                                  "legacy": {
+                                    "screen_name": "synthetic_friend_1",
+                                    "name": "Synthetic Friend 1",
+                                    "followers_count": 10
+                                  }
+                                }
+                              }
+                            },
+                            "legacy": {
+                              "id_str": "5012",
+                              "full_text": "good reply",
+                              "user_id_str": "900000000000000011",
+                              "favorite_count": 1,
+                              "reply_count": 0,
+                              "retweet_count": 0,
+                              "lang": "en"
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                ],
+                "displayType": "VerticalConversation"
+              }
+            },
+            {
+              "entryId": "conversationthread-5002",
+              "sortIndex": "7997",
+              "content": {
+                "entryType": "TimelineTimelineModule",
+                "__typename": "TimelineTimelineModule",
+                "items": [
+                  {
+                    "entryId": "conversationthread-5002-tweet-5021",
+                    "item": {
+                      "itemContent": {
+                        "itemType": "TimelineTweet",
+                        "__typename": "TimelineTweet",
+                        "tweet_results": {
+                          "result": {
+                            "__typename": "Tweet",
+                            "rest_id": "5021",
+                            "core": {
+                              "user_results": {
+                                "result": {
+                                  "__typename": "User",
+                                  "id": "VXNlcjo900000000000000021",
+                                  "rest_id": "900000000000000021",
+                                  "legacy": {
+                                    "screen_name": "synthetic_hater_1",
+                                    "name": "Synthetic Hater 1",
+                                    "followers_count": 10
+                                  }
+                                }
+                              }
+                            },
+                            "legacy": {
+                              "id_str": "5021",
+                              "full_text": "bad reply 2",
+                              "user_id_str": "900000000000000021",
+                              "favorite_count": 1,
+                              "reply_count": 0,
+                              "retweet_count": 0,
+                              "lang": "en"
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                ],
+                "displayType": "VerticalConversation"
+              }
+            },
+            {
+              "entryId": "conversationthread-5003",
+              "sortIndex": "7996",
+              "content": {
+                "entryType": "TimelineTimelineModule",
+                "__typename": "TimelineTimelineModule",
+                "items": [
+                  {
+                    "entryId": "conversationthread-5003-tweet-5031",
+                    "item": {
+                      "itemContent": {
+                        "itemType": "TimelineTweet",
+                        "__typename": "TimelineTweet",
+                        "tweet_results": {
+                          "result": {
+                            "__typename": "Tweet",
+                            "rest_id": "5031",
+                            "core": {
+                              "user_results": {
+                                "result": {
+                                  "__typename": "User",
+                                  "id": "VXNlcjo900000000000000012",
+                                  "rest_id": "900000000000000012",
+                                  "legacy": {
+                                    "screen_name": "synthetic_friend_2",
+                                    "name": "Synthetic Friend 2",
+                                    "followers_count": 10
+                                  }
+                                }
+                              }
+                            },
+                            "legacy": {
+                              "id_str": "5031",
+                              "full_text": "fine reply",
+                              "user_id_str": "900000000000000012",
+                              "favorite_count": 1,
+                              "reply_count": 0,
+                              "retweet_count": 0,
+                              "lang": "en"
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                ],
+                "displayType": "VerticalConversation"
+              }
+            },
+            {
+              "entryId": "cursor-bottom-7990",
+              "sortIndex": "7990",
+              "content": {
+                "entryType": "TimelineTimelineCursor",
+                "__typename": "TimelineTimelineCursor",
+                "value": "SYNTHETIC_DETAIL_CURSOR",
+                "cursorType": "Bottom"
+              }
+            }
+          ]
+        },
+        {
+          "type": "TimelineTerminateTimeline",
+          "direction": "Top"
+        }
+      ]
+    }
+  }
+}
